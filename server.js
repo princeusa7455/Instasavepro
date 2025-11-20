@@ -10,10 +10,6 @@ const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const express = require("express");
-const app = express();
-const PORT = process.env.PORT || 3000;
-
 // Default Home Route (Fixes Cannot GET /)
 app.get("/", (req, res) => {
   res.send("InstaSavePro Server is Running Successfully 🚀");
