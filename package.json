@@ -1,4 +1,15 @@
 {
+  "name": "instasavepro",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+{
   "name": "instasavepro-backend",
   "version": "1.0.0",
   "description": "Simple backend for InstaSavePro - extracts Instagram video URL and proxies download",
