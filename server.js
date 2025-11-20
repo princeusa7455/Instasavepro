@@ -10,6 +10,27 @@ const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const express = require("express");
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Default Home Route (Fixes Cannot GET /)
+app.get("/", (req, res) => {
+  res.send("InstaSavePro Server is Running Successfully 🚀");
+});
+
+// Test API Route
+app.get("/api", (req, res) => {
+  res.json({
+    status: "success",
+    message: "API Working Perfectly!"
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
 // Middlewares
 app.use(cors());
 app.use(express.json());
