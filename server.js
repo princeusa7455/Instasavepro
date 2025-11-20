@@ -1,4 +1,4 @@
-// server.js
+// server.js (more robust; replace your existing file)
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -11,80 +11,92 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middlewares
-app.use(cors({
-  origin: "*",
-  methods: "GET,POST",
-  allowedHeaders: "Content-Type"
-}));
-app.use(express.json());
 app.use(morgan('tiny'));
+app.use(cors({ origin: '*' })); // allow all origins for the frontend
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Basic rate limiting - adjust as needed
+// Rate limit for api endpoints
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30, // limit each IP to 30 requests per windowMs
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 60 * 1000,
+  max: 30,
 });
-app.use('/api/', limiter);
+app.use('/api', limiter);
 
-// Helper: try multiple ways to extract video URL from Instagram page HTML
-async function extractFromHtml(html, pageUrl) {
+// Utility: fetch with retries and strong headers
+async function fetchWithRetries(url, tries = 3, timeout = 15000) {
+  const commonHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.instagram.com/',
+  };
+
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const resp = await axios.get(url, {
+        headers: commonHeaders,
+        timeout,
+        maxRedirects: 5,
+        validateStatus: status => status < 500 // treat 4xx as success for handling
+      });
+      return resp;
+    } catch (err) {
+      lastErr = err;
+      // small backoff
+      await new Promise(r => setTimeout(r, 500 + i * 300));
+    }
+  }
+  throw lastErr;
+}
+
+// Helper: try multiple extraction strategies
+function extractVideoFromHtml(html) {
   const $ = cheerio.load(html);
 
-  // 1) Try og:video meta tag
+  // 1) og:video
   const ogVideo = $('meta[property="og:video"]').attr('content') || $('meta[property="og:video:secure_url"]').attr('content');
-  if (ogVideo && ogVideo.startsWith('http')) {
-    return { video: ogVideo };
-  }
+  if (ogVideo && ogVideo.startsWith('http')) return { video: ogVideo };
 
-  // 2) Look for JSON inside <script type="application/ld+json"> (sometimes contains contentUrl)
+  // 2) ld+json
   const ld = $('script[type="application/ld+json"]').html();
   if (ld) {
     try {
       const parsed = JSON.parse(ld);
-      if (parsed && parsed.contentUrl) {
-        return { video: parsed.contentUrl };
-      }
-    } catch (e) {
-      // ignore parse errors
-    }
+      if (parsed && parsed.contentUrl) return { video: parsed.contentUrl };
+    } catch (e) { /* ignore */ }
   }
 
-  // 3) Instagram sometimes embeds JSON in <script>window._sharedData = {...}</script>
+  // 3) window._sharedData
   let found = null;
   $('script').each((i, el) => {
-    const scriptText = $(el).html();
-    if (!scriptText) return;
-    if (scriptText.includes('window._sharedData')) {
-      try {
-        const jsonStr = scriptText.match(/window\._sharedData\s*=\s*(\{.*\});/s);
-        if (jsonStr && jsonStr[1]) {
-          const parsed = JSON.parse(jsonStr[1]);
-          // navigate to entry data for shortcode_media
-          const entry = parsed?.entry_data;
-          if (entry) {
-            const postPage = Object.values(entry)[0];
-            const post = postPage?.[0]?.graphql?.shortcode_media;
-            const videoUrl = post?.video_url || post?.display_resources?.slice(-1)[0]?.src;
-            if (videoUrl) found = videoUrl;
+    const s = $(el).html();
+    if (!s) return;
+    if (s.includes('window._sharedData')) {
+      const m = s.match(/window\._sharedData\s*=\s*(\{.*\});/s);
+      if (m && m[1]) {
+        try {
+          const parsed = JSON.parse(m[1]);
+          const shortcode_media = parsed?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+          if (shortcode_media) {
+            const v = shortcode_media.video_url || shortcode_media.display_resources?.slice(-1)[0]?.src;
+            if (v) found = v;
           }
-        }
-      } catch (e) {
-        // ignore
+        } catch (e) { /* ignore */ }
       }
     }
   });
   if (found) return { video: found };
 
-  // 4) As a fallback, try searching for "video_url" in raw HTML
+  // 4) raw match for "video_url"
   const simpleMatch = html.match(/"video_url":"([^"]+)"/);
   if (simpleMatch && simpleMatch[1]) {
     const decoded = simpleMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
     return { video: decoded };
   }
 
-  // 5) No video found
+  // 5) No video
   return null;
 }
 
@@ -102,91 +114,88 @@ app.get('/api/getVideo', async (req, res) => {
       return res.status(400).json({ error: 'Invalid URL' });
     }
 
-    // Only allow instagram domains
-    if (!parsed.hostname.includes('instagram.com') && !parsed.hostname.includes('www.instagram.com')) {
+    if (!/instagram\.com$/i.test(parsed.hostname) && !parsed.hostname.includes('instagram.com')) {
       return res.status(400).json({ error: 'URL must be an instagram.com link' });
     }
 
-    // Fetch HTML of the Instagram page
-    // Important: set a user-agent header resembling a browser to improve chance of correct HTML
-    const resp = await axios.get(igUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-      timeout: 15000,
-    });
-
-    const html = resp.data;
-
-    // Extract video URL
-    const extracted = await extractFromHtml(html, igUrl);
-    if (!extracted || !extracted.video) {
-      return res.status(404).json({ error: 'Could not extract video URL. The page structure may have changed or the post may not be a video.' });
+    // Fetch HTML
+    let resp;
+    try {
+      resp = await fetchWithRetries(igUrl, 3, 15000);
+    } catch (err) {
+      console.error('Fetch error:', err && err.message ? err.message : err);
+      return res.status(502).json({ error: 'Server error while fetching Instagram page' });
     }
 
-    // Try to get thumbnail (og:image)
+    // handle 4xx responses gracefully
+    if (resp.status === 403 || resp.status === 429) {
+      // Instagram likely blocked the request or rate-limited
+      return res.status(502).json({ error: 'Instagram blocked the request (403/429). Try again later or use a proxy.' });
+    }
+    if (resp.status === 404) {
+      return res.status(404).json({ error: 'Instagram post not found (404).' });
+    }
+
+    const html = resp.data;
+    const extracted = extractVideoFromHtml(html);
+
+    if (!extracted || !extracted.video) {
+      // try a fallback: og:image
+      const $ = cheerio.load(html);
+      const thumbnail = $('meta[property="og:image"]').attr('content') || $('meta[name="og:image"]').attr('content') || null;
+      return res.status(404).json({ error: 'Could not extract video URL. The post may be image-only, private, or Instagram changed its structure.', thumbnail });
+    }
+
+    // thumbnail
     const $ = cheerio.load(html);
     const thumbnail = $('meta[property="og:image"]').attr('content') || $('meta[name="og:image"]').attr('content') || null;
 
-    // Respond with video and thumbnail
     return res.json({
       video: extracted.video,
-      thumbnail: thumbnail,
+      thumbnail,
       source: igUrl,
     });
   } catch (err) {
-    console.error('Error in /api/getVideo:', err.message || err);
-    return res.status(500).json({ error: 'Server error while fetching Instagram page' });
+    console.error('Error in /api/getVideo:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Unexpected server error' });
   }
 });
 
-// Endpoint: proxy the video so the browser can download (avoid CORS issues on some URLs)
+// Endpoint: proxy the video to force download (stream)
 app.get('/api/download', async (req, res) => {
   try {
     const videoUrl = (req.query.video || '').trim();
     if (!videoUrl) return res.status(400).json({ error: 'Missing video query parameter' });
 
-    // Basic check
-    let parsed;
-    try {
-      parsed = new URL(videoUrl);
-    } catch (e) {
-      return res.status(400).json({ error: 'Invalid video URL' });
-    }
+    // basic validation
+    try { new URL(videoUrl); } catch (e) { return res.status(400).json({ error: 'Invalid video URL' }); }
 
-    // Stream the remote video
     const response = await axios({
       url: videoUrl,
       method: 'GET',
       responseType: 'stream',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36',
-        Accept: '*/*',
-        Referer: req.query.referer || 'https://www.instagram.com/',
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': '*/*',
+        'Referer': 'https://www.instagram.com/',
       },
-      timeout: 20000,
+      timeout: 20000
     });
 
-    // Mirror important headers
+    // mirror content-type
     res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
-    // Suggest a filename
     const filename = 'instagram_video.mp4';
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-
-    // Pipe stream
     response.data.pipe(res);
   } catch (err) {
-    console.error('Error in /api/download:', err.message || err);
+    console.error('Error in /api/download:', err && err.message ? err.message : err);
     return res.status(500).json({ error: 'Failed to download/stream video' });
   }
 });
 
-// Serve static frontend if placed in "public" folder (optional)
-app.use('/', express.static('public'));
+// Optional: simple root page
+app.get('/', (req, res) => res.send('InstaSavePro backend is running.'));
 
 app.listen(PORT, () => {
-  console.log(`InstaSavePro backend running on port ${PORT}`);
+  console.log(`InstaSavePro backend listening on ${PORT}`);
 });
